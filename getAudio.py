@@ -11,6 +11,9 @@ from scipy.io import wavfile
 from sklearn.metrics import confusion_matrix
 import itertools
 
+import librosa
+import cv2
+
 # Set paths to input and output data
 INPUT_DIR = 'free-spoken-digit-dataset-master/recordings/'
 OUTPUT_DIR =  "out"
@@ -21,6 +24,12 @@ if 0: # test out
     for i in range(10):
         print(parent_list[i])
     
+
+def scale_minmax(X, min=0.0, max=1.0):
+    X_std = (X - X.min()) / (X.max() - X.min())
+    X_scaled = X_std * (max - min) + min
+    return X_scaled
+
     
 # Utility function to get sound and frame rate info
 def get_wav_info(wav_file):
@@ -31,10 +40,37 @@ def get_wav_info(wav_file):
     wav.close()
     return sound_info, frame_rate
 
+def spectrogram_image(y, sr, out_name, hop_length, n_mels):
+    spec = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=n_mels, n_fft=hop_length*2, hop_length=hop_length)    
+    spec = np.log(spec + 1e-9) # add small number to avoid log(0)
+    
+    # min-max scale to fit inside 8-bit range
+    img = scale_minmax(spec, 0, 255).astype(np.uint8)
+    img = np.flip(img, axis=0) # put low frequencies at the bottom in image
+    img = 255 - img            # invert. make black==more energy
+
+    out_name = out_name + ".png"
+    # save as PNG    
+    cv2.imwrite(out_name, img)
+
+
 # For every recording, make a spectogram and save it as label_speaker_no.png
 if not os.path.exists(os.path.join(OUTPUT_DIR, 'audio-images')):
     dirname = os.path.dirname(__file__)
     os.mkdir(os.path.join(OUTPUT_DIR, "audio-images"))
+    
+# Declare constants
+IMAGE_HEIGHT = 128
+IMAGE_WIDTH = 64
+BATCH_SIZE = 128
+N_CHANNELS = 1
+N_CLASSES = 10    
+    
+    
+hop_length = 128            # number of samples per time-step in spectrogram
+n_mels = IMAGE_HEIGHT        # number of bins in spectrogram. Height of image
+time_steps = IMAGE_WIDTH - 1 # number of time-steps. Width of image (TODO FIX it add 1 px to width!!)    
+
     
 for filename in os.listdir(INPUT_DIR):
     if "wav" in filename:
@@ -48,9 +84,17 @@ for filename in os.listdir(INPUT_DIR):
                 os.mkdir(dist_dir)
             file_stem = Path(file_path).stem
             sound_info, frame_rate = get_wav_info(file_path)
-            pylab.specgram(sound_info, Fs=frame_rate)
-            pylab.savefig(f'{file_dist_path}.png')
-            pylab.close()
+            
+            y, sr = librosa.load(file_path, res_type='kaiser_fast')
+            y = librosa.util.utils.fix_length(y, 1*sr)
+                  
+            start_sample = 0 # starting at beginning
+            length_samples = time_steps * hop_length
+            window = y[start_sample:start_sample+length_samples]
+            
+            # spectrogram_image(y=y, sr=sr, out_name=file_dist_path, hop_length=hop_length, n_mels=n_mels)
+            spectrogram_image(y=window, sr=sr, out_name=file_dist_path, hop_length=hop_length, n_mels=n_mels)
+            
 
 # Print the ten classes in our dataset
 path_list = os.listdir(os.path.join(OUTPUT_DIR, 'audio-images'))
@@ -66,21 +110,13 @@ for i in range(10):
     
     
     
-
-# Declare constants
-IMAGE_HEIGHT = 256
-IMAGE_WIDTH = 256
-BATCH_SIZE = 32
-N_CHANNELS = 3
-N_CLASSES = 10
-
 # Make a dataset containing the training spectrograms
 train_dataset = tf.keras.preprocessing.image_dataset_from_directory(
                                              batch_size=BATCH_SIZE,
                                              validation_split=0.2,
                                              directory=os.path.join(OUTPUT_DIR, 'audio-images'),
                                              shuffle=True,
-                                             color_mode='rgb',
+                                             color_mode='grayscale',
                                              image_size=(IMAGE_HEIGHT, IMAGE_WIDTH),
                                              subset="training",
                                              seed=0)
@@ -91,7 +127,7 @@ valid_dataset = tf.keras.preprocessing.image_dataset_from_directory(
                                              validation_split=0.2,
                                              directory=os.path.join(OUTPUT_DIR, 'audio-images'),
                                              shuffle=True,
-                                             color_mode='rgb',
+                                             color_mode='grayscale',
                                              image_size=(IMAGE_HEIGHT, IMAGE_WIDTH),
                                              subset="validation",
                                              seed=0)
@@ -130,15 +166,15 @@ valid_dataset = prepare(valid_dataset, augment=False)
 # Create CNN model
 model = tf.keras.models.Sequential()
 model.add(tf.keras.layers.Input(shape=(IMAGE_HEIGHT, IMAGE_WIDTH, N_CHANNELS)))
-model.add(tf.keras.layers.Conv2D(32, 3, strides=2, padding='same', activation='relu'))
+model.add(tf.keras.layers.Conv2D(16, 3, strides=2, padding='same', activation='relu'))
+model.add(tf.keras.layers.BatchNormalization())
+model.add(tf.keras.layers.MaxPooling2D(pool_size=(2, 2)))
+model.add(tf.keras.layers.BatchNormalization())
+model.add(tf.keras.layers.Conv2D(32, 3, padding='same', activation='relu'))
 model.add(tf.keras.layers.BatchNormalization())
 model.add(tf.keras.layers.MaxPooling2D(pool_size=(2, 2)))
 model.add(tf.keras.layers.BatchNormalization())
 model.add(tf.keras.layers.Conv2D(64, 3, padding='same', activation='relu'))
-model.add(tf.keras.layers.BatchNormalization())
-model.add(tf.keras.layers.MaxPooling2D(pool_size=(2, 2)))
-model.add(tf.keras.layers.BatchNormalization())
-model.add(tf.keras.layers.Conv2D(128, 3, padding='same', activation='relu'))
 model.add(tf.keras.layers.BatchNormalization())
 model.add(tf.keras.layers.MaxPooling2D(pool_size=(2, 2)))
 model.add(tf.keras.layers.BatchNormalization())
@@ -151,12 +187,13 @@ model.add(tf.keras.layers.Dense(N_CLASSES, activation='softmax'))
 # Compile model
 model.compile(
     loss='sparse_categorical_crossentropy',
-    optimizer=tf.keras.optimizers.RMSprop(),
+    # optimizer=tf.keras.optimizers.RMSprop(),
+    optimizer='adam',
     metrics=['accuracy'],
 )
 
 # Train model for 10 epochs, capture the history
-history = model.fit(train_dataset, epochs=10, validation_data=valid_dataset)
+history = model.fit(train_dataset, epochs=50, validation_data=valid_dataset)
 
 
 # Plot the loss curves for training and validation.
